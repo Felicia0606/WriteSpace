@@ -1,0 +1,5 @@
+project_id = "classroom-peer-review"
+
+[functions.peer-review]
+# The handler verifies Firebase signatures, issuer, audience and expiry itself.
+verify_jwt = false

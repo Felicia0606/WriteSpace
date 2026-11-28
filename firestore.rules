@@ -1,0 +1,402 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Is the user authenticated?
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Is the user the teacher of this class?
+    function isClassTeacher(classId) {
+      return isAuthenticated() &&
+        request.auth.uid == get(/databases/$(database)/documents/classes/$(classId)).data.teacherId;
+    }
+
+    // Helper: Get the student record for this user in this class
+    function getStudent(classId) {
+      return get(/databases/$(database)/documents/classes/$(classId)/students/$(request.auth.uid)).data;
+    }
+
+    // Helper: Is this user a student in the given group?
+    function isStudentInGroup(classId, groupId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/classes/$(classId)/students/$(request.auth.uid)) &&
+        getStudent(classId).groupId == groupId;
+    }
+
+    // Helper: Is this user a student in this class at all?
+    function isStudentInClass(classId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/classes/$(classId)/students/$(request.auth.uid));
+    }
+
+    function isCurrentMember(classId, groupId) {
+      return isStudentInGroup(classId, groupId) &&
+        (
+          !('memberIds' in get(/databases/$(database)/documents/classes/$(classId)/groups/$(groupId)).data) ||
+          request.auth.uid in get(/databases/$(database)/documents/classes/$(classId)/groups/$(groupId)).data.memberIds
+        );
+    }
+
+    function isSubmittedGroup(classId, groupId) {
+      return exists(/databases/$(database)/documents/classes/$(classId)/groups/$(groupId)) &&
+        get(/databases/$(database)/documents/classes/$(classId)/groups/$(groupId)).data.status in
+          ['SUBMITTED', 'REVIEWING', 'REVIEWED'];
+    }
+
+    function isPeerReviewEnabled(classId) {
+      return exists(/databases/$(database)/documents/classes/$(classId)/peerReviewChecklist/active) &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewChecklist/active).data.peerReviewEnabled == true;
+    }
+
+    function isPeerReviewEligible(classId, reviewerGroupId, targetGroupId) {
+      return isPeerCheckEligible(classId, reviewerGroupId, targetGroupId);
+    }
+
+    // Teacher-controlled reading/commenting is available before submission.
+    // Checklist publication and voting retain their existing submission rules.
+    function isPeerCheckEligible(classId, reviewerGroupId, targetGroupId) {
+      return reviewerGroupId != targetGroupId &&
+        isPeerReviewEnabled(classId) &&
+        isCurrentMember(classId, reviewerGroupId) &&
+        exists(/databases/$(database)/documents/classes/$(classId)/groups/$(targetGroupId));
+    }
+
+    function isPublishedReadMember(classId, targetGroupId) {
+      return isClassTeacher(classId) ||
+        isCurrentMember(classId, targetGroupId);
+    }
+
+    // ---- Classes ----
+    match /classes/{classId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isClassTeacher(classId);
+    }
+
+    // ---- Groups ----
+    match /classes/{classId}/groups/{groupId} {
+      allow read: if isAuthenticated() && isStudentInClass(classId) || isClassTeacher(classId);
+      allow create, delete: if isClassTeacher(classId);
+      allow update: if isClassTeacher(classId) || (
+        isAuthenticated() &&
+        resource.data.status == 'WRITING' &&
+        resource.data.locked == false &&
+        request.resource.data.classId == resource.data.classId &&
+        request.resource.data.maxMembers == resource.data.maxMembers
+      );
+    }
+
+    // ---- Students ----
+    match /classes/{classId}/students/{studentUid} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.auth.uid == studentUid;
+      allow update: if isClassTeacher(classId) || request.auth.uid == studentUid;
+      allow delete: if isClassTeacher(classId);
+    }
+
+    // ---- Documents ----
+    match /documents/{groupId} {
+      // Teacher can read all; peers can read class essays while peer check is open.
+      allow read: if isClassTeacher(resource.data.classId) ||
+        isStudentInGroup(resource.data.classId, groupId) ||
+        (isStudentInClass(resource.data.classId) &&
+         isPeerCheckEligible(
+           resource.data.classId,
+           getStudent(resource.data.classId).groupId,
+           groupId
+         ));
+
+      // Writes allowed only if teacher OR (student in group AND document NOT locked)
+      allow write: if isClassTeacher(resource.data.classId) ||
+        (isStudentInGroup(resource.data.classId, groupId) &&
+         resource.data.locked == false &&
+         request.resource.data.locked == false);
+    }
+
+    // ---- Annotations ----
+    match /annotations/{annotationId} {
+      allow read: if isClassTeacher(resource.data.classId) ||
+        isStudentInGroup(resource.data.classId, resource.data.groupId);
+      // Only teacher can create/edit annotations
+      allow write: if isClassTeacher(resource.data.classId);
+    }
+
+    // ---- Comments & Highlights ----
+    match /comments/{commentId} {
+      allow read: if isClassTeacher(resource.data.classId) ||
+        isStudentInGroup(resource.data.classId, resource.data.groupId) ||
+        (
+          isStudentInClass(resource.data.classId) &&
+          isPeerCheckEligible(resource.data.classId,
+            getStudent(resource.data.classId).groupId,
+            resource.data.groupId)
+        );
+      allow create: if isAuthenticated() &&
+        request.resource.data.authorId == request.auth.uid &&
+        request.resource.data.body is string &&
+        request.resource.data.body.size() > 0 &&
+        request.resource.data.body.size() <= 2000 &&
+        (request.resource.data.selectedText == null ||
+         (request.resource.data.selectedText is string && request.resource.data.selectedText.size() <= 500)) &&
+        (
+          request.resource.data.parentId == null ||
+          (
+            exists(/databases/$(database)/documents/comments/$(request.resource.data.parentId)) &&
+            get(/databases/$(database)/documents/comments/$(request.resource.data.parentId)).data.classId == request.resource.data.classId &&
+            get(/databases/$(database)/documents/comments/$(request.resource.data.parentId)).data.groupId == request.resource.data.groupId &&
+            get(/databases/$(database)/documents/comments/$(request.resource.data.parentId)).data.parentId == null &&
+            get(/databases/$(database)/documents/comments/$(request.resource.data.parentId)).data.isDeleted != true &&
+            get(/databases/$(database)/documents/comments/$(request.resource.data.parentId)).data.status != 'resolved'
+          )
+        ) &&
+        (
+          (request.resource.data.authorRole == 'teacher' && isClassTeacher(request.resource.data.classId)) ||
+          (
+            request.resource.data.authorRole == 'student' &&
+            isStudentInClass(request.resource.data.classId) &&
+            (
+              isStudentInGroup(request.resource.data.classId, request.resource.data.groupId) ||
+              (
+                isStudentInClass(request.resource.data.classId) &&
+                isPeerCheckEligible(
+                  request.resource.data.classId,
+                  getStudent(request.resource.data.classId).groupId,
+                  request.resource.data.groupId
+                )
+              )
+            )
+          )
+        );
+      allow update: if
+        (
+          resource.data.authorId == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['body', 'editedAt', 'updatedAt']) &&
+          request.resource.data.body is string &&
+          request.resource.data.body.size() > 0 &&
+          request.resource.data.body.size() <= 2000
+        ) ||
+        (
+          resource.data.authorId == request.auth.uid &&
+          resource.data.parentId == null &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['isDeleted', 'deletedAt', 'deletedBy', 'updatedAt']) &&
+          request.resource.data.isDeleted == true &&
+          request.resource.data.deletedBy == request.auth.uid
+        ) ||
+        (
+          isClassTeacher(resource.data.classId) &&
+          resource.data.parentId == null &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'resolvedAt', 'resolvedBy', 'updatedAt']) &&
+          request.resource.data.status in ['open', 'resolved'] &&
+          (
+            request.resource.data.status == 'resolved' &&
+            request.resource.data.resolvedBy == request.auth.uid ||
+            request.resource.data.status == 'open'
+          )
+        );
+      allow delete: if
+        resource.data.authorId == request.auth.uid &&
+        resource.data.parentId != null;
+    }
+
+    // ---- Peer Review Checklist Configuration ----
+    match /classes/{classId}/peerReviewChecklist/{configId} {
+      allow read: if isClassTeacher(classId) || isStudentInClass(classId);
+      allow create, update: if isClassTeacher(classId) &&
+        request.resource.data.classId == classId &&
+        request.resource.data.activeVersionId is string &&
+        request.resource.data.versionNumber is int &&
+        (!('peerReviewEnabled' in request.resource.data) ||
+         request.resource.data.peerReviewEnabled is bool) &&
+        request.resource.data.updatedBy == request.auth.uid;
+      allow delete: if false;
+    }
+
+    match /classes/{classId}/checklistVersions/{versionId} {
+      allow read: if isClassTeacher(classId) || isStudentInClass(classId);
+      allow create: if isClassTeacher(classId) &&
+        request.resource.data.classId == classId &&
+        request.resource.data.id == versionId &&
+        request.resource.data.versionNumber is int &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.criteria is list &&
+        request.resource.data.criteria.size() > 0 &&
+        request.resource.data.criterionIds is list &&
+        request.resource.data.criterionIds.size() > 0;
+      allow update, delete: if false;
+    }
+
+    // ---- Private Shared Peer Review Draft ----
+    match /classes/{classId}/peerReviewDrafts/{pairId} {
+      allow read: if isClassTeacher(classId) ||
+        isCurrentMember(classId, resource.data.reviewerGroupId);
+
+      allow create: if
+        isPeerReviewEligible(classId,
+          request.resource.data.reviewerGroupId,
+          request.resource.data.targetGroupId) &&
+        pairId == (
+          request.resource.data.reviewerGroupId +
+          '__' +
+          request.resource.data.targetGroupId
+        ) &&
+        request.resource.data.classId == classId &&
+        request.resource.data.checklistVersionId is string &&
+        exists(/databases/$(database)/documents/classes/$(classId)/checklistVersions/$(request.resource.data.checklistVersionId)) &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewChecklist/active).data.activeVersionId ==
+          request.resource.data.checklistVersionId &&
+        request.resource.data.status == 'draft' &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.revision is int;
+
+      allow update: if
+        isCurrentMember(classId, resource.data.reviewerGroupId) &&
+        isPeerReviewEnabled(classId) &&
+        resource.data.status == 'draft' &&
+        request.resource.data.status == 'draft' &&
+        request.resource.data.classId == resource.data.classId &&
+        request.resource.data.reviewerGroupId == resource.data.reviewerGroupId &&
+        request.resource.data.targetGroupId == resource.data.targetGroupId &&
+        request.resource.data.checklistVersionId == resource.data.checklistVersionId &&
+        request.resource.data.createdBy == resource.data.createdBy &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.revision == resource.data.revision + 1 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'overallFeedback',
+          'updatedBy',
+          'updatedAt',
+          'revision'
+        ]);
+
+      allow delete: if false;
+
+      match /reviewers/{uid}/responses/{criterionId} {
+        allow read: if request.auth != null && request.auth.uid == uid &&
+          isCurrentMember(classId, get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.reviewerGroupId);
+        allow create, update: if request.auth != null && request.auth.uid == uid &&
+          isPeerReviewEnabled(classId) &&
+          isCurrentMember(classId, get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.reviewerGroupId) &&
+          get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.status == 'draft' &&
+          criterionId in get(/databases/$(database)/documents/classes/$(classId)/checklistVersions/$(get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.checklistVersionId)).data.criterionIds &&
+          request.resource.data.keys().hasOnly(['criterionId', 'checked', 'updatedBy', 'updatedAt']) &&
+          request.resource.data.criterionId == criterionId && request.resource.data.checked is bool &&
+          request.resource.data.updatedBy == uid;
+        allow delete: if false;
+      }
+
+      match /responses/{criterionId} {
+        allow read: if isClassTeacher(classId) ||
+          isCurrentMember(classId, get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.reviewerGroupId);
+
+        allow create, update: if
+          isPeerReviewEnabled(classId) &&
+          isCurrentMember(classId,
+            get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.reviewerGroupId) &&
+          get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.status == 'draft' &&
+          criterionId in get(/databases/$(database)/documents/classes/$(classId)/checklistVersions/$(get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.checklistVersionId)).data.criterionIds &&
+          request.resource.data.criterionId == criterionId &&
+          request.resource.data.checked is bool &&
+          request.resource.data.updatedBy == request.auth.uid;
+
+        allow delete: if false;
+      }
+    }
+
+    // ---- Published Shared Peer Review Result ----
+    match /classes/{classId}/peerReviews/{pairId} {
+      allow read: if
+        isClassTeacher(classId) ||
+        isCurrentMember(classId, resource.data.reviewerGroupId) ||
+        isCurrentMember(classId, resource.data.targetGroupId);
+
+      allow create: if
+        isPeerReviewEligible(classId,
+          request.resource.data.reviewerGroupId,
+          request.resource.data.targetGroupId) &&
+        pairId == (
+          request.resource.data.reviewerGroupId +
+          '__' +
+          request.resource.data.targetGroupId
+        ) &&
+        request.resource.data.classId == classId &&
+        request.resource.data.status == 'submitted' &&
+        request.resource.data.submittedBy == request.auth.uid &&
+        request.resource.data.checklistVersionId is string &&
+        exists(/databases/$(database)/documents/classes/$(classId)/checklistVersions/$(request.resource.data.checklistVersionId)) &&
+        exists(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)) &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.classId == classId &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.reviewerGroupId == request.resource.data.reviewerGroupId &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.targetGroupId == request.resource.data.targetGroupId &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.checklistVersionId == request.resource.data.checklistVersionId &&
+        get(/databases/$(database)/documents/classes/$(classId)/peerReviewDrafts/$(pairId)).data.status == 'draft';
+
+      allow update: if
+        isCurrentMember(classId, resource.data.reviewerGroupId) &&
+        isPeerReviewEnabled(classId) &&
+        request.resource.data.classId == resource.data.classId &&
+        request.resource.data.reviewerGroupId == resource.data.reviewerGroupId &&
+        request.resource.data.targetGroupId == resource.data.targetGroupId &&
+        request.resource.data.checklistVersionId == resource.data.checklistVersionId &&
+        request.resource.data.createdBy == resource.data.createdBy &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.submittedBy == resource.data.submittedBy &&
+        request.resource.data.submittedAt == resource.data.submittedAt &&
+        request.resource.data.updatedBy == request.auth.uid &&
+        request.resource.data.revision == resource.data.revision + 1 &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'overallFeedback',
+          'updatedBy',
+          'updatedAt',
+          'revision'
+        ]);
+
+      allow delete: if false;
+
+      match /responses/{criterionId} {
+        allow read: if
+          isClassTeacher(classId) ||
+          isCurrentMember(classId, get(/databases/$(database)/documents/classes/$(classId)/peerReviews/$(pairId)).data.reviewerGroupId) ||
+          isCurrentMember(classId, get(/databases/$(database)/documents/classes/$(classId)/peerReviews/$(pairId)).data.targetGroupId);
+
+        allow create, update: if
+          isCurrentMember(classId,
+            get(/databases/$(database)/documents/classes/$(classId)/peerReviews/$(pairId)).data.reviewerGroupId) &&
+          isPeerReviewEnabled(classId) &&
+          criterionId in get(/databases/$(database)/documents/classes/$(classId)/checklistVersions/$(get(/databases/$(database)/documents/classes/$(classId)/peerReviews/$(pairId)).data.checklistVersionId)).data.criterionIds &&
+          request.resource.data.criterionId == criterionId &&
+          request.resource.data.checked is bool &&
+          request.resource.data.updatedBy == request.auth.uid;
+
+        allow delete: if false;
+      }
+    }
+
+    // ---- Votes (Atomic & Immutable) ----
+    match /classes/{classId}/votes/{voteId} {
+      allow read: if isClassTeacher(classId) || isStudentInClass(classId);
+      allow create: if isStudentInClass(classId) &&
+        request.resource.data.voterUid == request.auth.uid &&
+        voteId == (request.auth.uid + '_' + request.resource.data.groupId) &&
+        exists(/databases/$(database)/documents/classes/$(classId)/groups/$(request.resource.data.groupId)) &&
+        get(/databases/$(database)/documents/classes/$(classId)/groups/$(request.resource.data.groupId)).data.status in ['SUBMITTED', 'REVIEWING', 'REVIEWED'];
+      allow update, delete: if false;
+    }
+
+    // ---- Voter Quotas ----
+    match /classes/{classId}/voterQuotas/{voterUid} {
+      allow read: if isClassTeacher(classId) || (isAuthenticated() && request.auth.uid == voterUid);
+      allow create, update: if isStudentInClass(classId) &&
+        request.auth.uid == voterUid &&
+        request.resource.data.count is int &&
+        request.resource.data.count >= 1 &&
+        request.resource.data.count <= get(/databases/$(database)/documents/classes/$(classId)).data.votesPerStudent;
+      allow delete: if isClassTeacher(classId);
+    }
+  }
+}

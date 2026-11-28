@@ -1,0 +1,41 @@
+import { ReactNode } from 'react';
+import { X } from 'lucide-react';
+import { cn } from '@/utils';
+
+interface ModalProps {
+  open: boolean;
+  onClose: () => void;
+  title?: string;
+  children: ReactNode;
+  size?: 'sm' | 'md' | 'lg' | 'xl';
+}
+
+export function Modal({ open, onClose, title, children, size = 'md' }: ModalProps) {
+  if (!open) return null;
+
+  const sizes = {
+    sm: 'max-w-sm',
+    md: 'max-w-md',
+    lg: 'max-w-lg',
+    xl: 'max-w-6xl w-[95vw]',
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/45 backdrop-blur-sm">
+      <div className={cn('w-full max-h-[92vh] flex flex-col bg-white rounded-3xl shadow-2xl overflow-hidden border border-slate-100', sizes[size])}>
+        {title && (
+          <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 shrink-0">
+            <h3 className="text-lg font-bold tracking-tight text-slate-900">{title}</h3>
+            <button
+              onClick={onClose}
+              className="text-slate-400 hover:text-slate-700 transition p-1 rounded-lg hover:bg-slate-50 focus:outline-none"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        )}
+        <div className="p-6 overflow-y-auto">{children}</div>
+      </div>
+    </div>
+  );
+}
